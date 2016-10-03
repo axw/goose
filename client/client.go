@@ -1,11 +1,15 @@
 package client
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
+	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,10 +35,10 @@ const (
 
 // Client implementations sends service requests to an OpenStack deployment.
 type Client interface {
-	SendRequest(method, svcType, apiCall string, requestData *goosehttp.RequestData) (err error)
+	SendRequest(method, svcType, svcVersion, apiCall string, requestData *goosehttp.RequestData) (err error)
 	// MakeServiceURL prepares a full URL to a service endpoint, with optional
 	// URL parts. It uses the first endpoint it can find for the given service type.
-	MakeServiceURL(serviceType string, parts []string) (string, error)
+	MakeServiceURL(serviceType, apiVersion string, parts []string) (string, error)
 }
 
 // AuthenticatingClient sends service requests to an OpenStack deployment after first validating
@@ -78,18 +82,18 @@ type authenticatingClient struct {
 
 	authOptions identity.AuthOptions
 
-	// Service type to endpoint URLs for each available region
-	regionServiceURLs map[string]identity.ServiceURLs
-
-	// Service type to endpoint URLs for the authenticated region
-	serviceURLs identity.ServiceURLs
-
 	// The service types which must be available after authentication,
 	// or else services which use this client will not be able to function as expected.
 	requiredServiceTypes []string
 	tokenId              string
 	tenantId             string
 	userId               string
+
+	// Service type to endpoint URLs for each available region
+	regionServiceURLs map[string]identity.ServiceURLs
+
+	// Service type to endpoint URLs for the authenticated region
+	serviceURLs identity.ServiceURLs
 }
 
 func (c *authenticatingClient) EndpointsForRegion(region string) identity.ServiceURLs {
@@ -151,8 +155,8 @@ func (c *client) sendRequest(method, url, token string, requestData *goosehttp.R
 	return
 }
 
-func (c *client) SendRequest(method, svcType, apiCall string, requestData *goosehttp.RequestData) error {
-	url, _ := c.MakeServiceURL(svcType, []string{apiCall})
+func (c *client) SendRequest(method, svcType, apiVersion, apiCall string, requestData *goosehttp.RequestData) error {
+	url, _ := c.MakeServiceURL(svcType, apiVersion, []string{apiCall})
 	return c.sendRequest(method, url, "", requestData)
 }
 
@@ -163,7 +167,7 @@ func makeURL(base string, parts []string) string {
 	return base + strings.Join(parts, "/")
 }
 
-func (c *client) MakeServiceURL(serviceType string, parts []string) (string, error) {
+func (c *client) MakeServiceURL(serviceType, apiVersion string, parts []string) (string, error) {
 	return makeURL(c.baseURL, parts), nil
 }
 
@@ -171,36 +175,197 @@ func (c *authenticatingClient) SetRequiredServiceTypes(requiredServiceTypes []st
 	c.requiredServiceTypes = requiredServiceTypes
 }
 
-func (c *authenticatingClient) SendRequest(method, svcType, apiCall string, requestData *goosehttp.RequestData) (err error) {
-	err = c.sendAuthRequest(method, svcType, apiCall, requestData)
+func (c *authenticatingClient) SendRequest(
+	method, svcType, apiVersion, apiCall string,
+	requestData *goosehttp.RequestData,
+) (err error) {
+	err = c.sendAuthRequest(method, svcType, apiVersion, apiCall, requestData)
 	if gooseerrors.IsUnauthorised(err) {
 		c.setToken("")
-		err = c.sendAuthRequest(method, svcType, apiCall, requestData)
+		err = c.sendAuthRequest(method, svcType, apiVersion, apiCall, requestData)
 	}
 	return
 }
 
-func (c *authenticatingClient) sendAuthRequest(method, svcType, apiCall string, requestData *goosehttp.RequestData) (err error) {
+func (c *authenticatingClient) sendAuthRequest(
+	method, svcType, apiVersion, apiCall string,
+	requestData *goosehttp.RequestData,
+) (err error) {
 	if err = c.Authenticate(); err != nil {
 		return
 	}
 
-	url, err := c.MakeServiceURL(svcType, []string{apiCall})
+	url, err := c.MakeServiceURL(svcType, apiVersion, []string{apiCall})
 	if err != nil {
 		return
 	}
 	return c.sendRequest(method, url, c.Token(), requestData)
 }
 
-func (c *authenticatingClient) MakeServiceURL(serviceType string, parts []string) (string, error) {
+func (c *authenticatingClient) MakeServiceURL(serviceType, apiVersion string, parts []string) (string, error) {
 	if !c.IsAuthenticated() {
 		return "", errors.New("cannot get endpoint URL without being authenticated")
 	}
-	url, ok := c.serviceURLs[serviceType]
+	serviceURL, ok := c.serviceURLs[serviceType]
 	if !ok {
 		return "", errors.New("no endpoints known for service type: " + serviceType)
 	}
-	return makeURL(url, parts), nil
+	if serviceType == "object-store" {
+		// object-store has no versioning capability.
+		return serviceURL, nil
+	}
+	requestedVersion, err := parseVersion(apiVersion)
+	if err != nil {
+		return "", err
+	}
+	rootURL, serviceURLSuffix, versions, err := c.getAPIVersions(serviceURL)
+	if err != nil {
+		return "", err
+	}
+	serviceURL, err = getAPIVersionURL(rootURL, serviceURLSuffix, versions, requestedVersion)
+	if err != nil {
+		return "", err
+	}
+	return makeURL(serviceURL, parts), nil
+}
+
+func getAPIVersionURL(rootURL *url.URL, serviceURLSuffix string, versions []apiVersionInfo, requested apiVersion) (string, error) {
+	var match string
+	for _, v := range versions {
+		if v.Version.major != requested.major {
+			continue
+		}
+		if requested.minor != -1 && v.Version.minor != requested.minor {
+			continue
+		}
+		for _, link := range v.Links {
+			if link.Rel != "self" {
+				continue
+			}
+			hrefURL, err := url.Parse(link.Href)
+			if err != nil {
+				return "", err
+			}
+			match = hrefURL.Path
+		}
+		if requested.minor != -1 {
+			break
+		}
+	}
+	if match == "" {
+		return "", fmt.Errorf("could not find matching URL")
+	}
+	versionURL := *rootURL
+	versionURL.Path = path.Join(versionURL.Path, match, serviceURLSuffix)
+	return versionURL.String(), nil
+}
+
+type apiVersion struct {
+	major int
+	minor int
+}
+
+func (v *apiVersion) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	parsed, err := parseVersion(s)
+	if err != nil {
+		return err
+	}
+	*v = parsed
+	return nil
+}
+
+func parseVersion(s string) (apiVersion, error) {
+	s = strings.TrimPrefix(s, "v")
+	parts := strings.SplitN(s, ".", 2)
+	if len(parts) == 0 || len(parts) > 2 {
+		return apiVersion{}, fmt.Errorf("invalid API version %q", s)
+	}
+	var minor int = -1
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return apiVersion{}, err
+	}
+	if len(parts) == 2 {
+		var err error
+		minor, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return apiVersion{}, err
+		}
+	}
+	return apiVersion{major, minor}, nil
+}
+
+type apiVersionInfo struct {
+	Version apiVersion       `json:"id"`
+	Links   []apiVersionLink `json:"links"`
+	Status  string           `json:"status"`
+}
+
+type apiVersionLink struct {
+	Href string `json:"href"`
+	Rel  string `json:"rel"`
+}
+
+func (c *authenticatingClient) getAPIVersions(serviceCatalogURL string) (*url.URL, string, []apiVersionInfo, error) {
+	url, err := url.Parse(serviceCatalogURL)
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	var raw struct {
+		Versions json.RawMessage `json:"versions"`
+	}
+	requestData := &goosehttp.RequestData{
+		RespValue: &raw,
+		ExpectedStatus: []int{
+			http.StatusOK,
+			http.StatusMultipleChoices,
+		},
+	}
+
+	// Identify the version in the URL, if there is one, and record
+	// everything proceeding it. We will need to append this to the
+	// API version-specific base URL.
+	var pathParts []string
+	if url.Path != "/" {
+		pathParts = strings.Split(strings.Trim(url.Path, "/"), "/")
+		if _, err := parseVersion(pathParts[0]); err == nil {
+			pathParts = pathParts[1:]
+		}
+		url.Path = "/"
+	}
+
+	baseURL := url.String()
+	if err := c.sendRequest("GET", baseURL, c.Token(), requestData); err != nil {
+		return nil, "", nil, err
+	}
+
+	// Some services respond with {"versions":[...]}, and
+	// some respond with {"versions":{"values":[...]}}.
+	var object interface{}
+	var versions []apiVersionInfo
+	if err := json.Unmarshal(raw.Versions, &object); err != nil {
+		return nil, "", nil, err
+	}
+	if _, ok := object.(map[string]interface{}); ok {
+		var valuesObject struct {
+			Values []apiVersionInfo `json:"values"`
+		}
+		if err := json.Unmarshal(raw.Versions, &valuesObject); err != nil {
+			return nil, "", nil, err
+		}
+		versions = valuesObject.Values
+	} else {
+		if err := json.Unmarshal(raw.Versions, &versions); err != nil {
+			return nil, "", nil, err
+		}
+	}
+
+	return url, strings.Join(pathParts, "/"), versions, nil
 }
 
 // Return the relevant service endpoint URLs for this client's region.
